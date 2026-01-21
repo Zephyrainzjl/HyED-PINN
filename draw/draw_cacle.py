@@ -132,7 +132,6 @@ def get_origin_data(b_name,dV_threshold=0.000001,window_size=20):
 DATA_OUT=get_origin_data(Battery_list[0])
 import random
 
-
 def smooth_and_normalize_columns(arr, window_size=3):
     """
     Smooths all but the last column of the input array using a moving average
