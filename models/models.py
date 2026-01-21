@@ -470,50 +470,79 @@ class PINN_MOE(nn.Module):
         tx.requires_grad_(True)
         # 解耦输入
         t_x = self.Decoupling(tx)
-        t = t_x[:, 0:1]
-        x = t_x[:, 1:]
+        def safe_grad(y, x_):
+            # 如果 y 本身就不在计算图里（不需要梯度），直接返回 0（但要保持和 x_ 有依赖，方便二阶导）
+            if (not torch.is_tensor(y)) or (not y.requires_grad):
+                return x_ * 0.0
+
+            g = grad(y, x_, create_graph=True, only_inputs=True, allow_unused=True)[0]
+            if g is None:
+                # 关键：不能用 zeros_like(x_)，要用 x_*0，让它仍然“挂在”x_上，从而有 grad_fn
+                return x_ * 0.0
+            return g
+
+        t=t_x[:,0:1]
+        x=t_x[:,1:]
         # 预测物理量
-        s_pred, experts = self.multi_physics(torch.cat((t, x), dim=1))
+        s_pred,experts = self.multi_physics(torch.cat((t,x),dim=1))
         # 计算 s_pred 对 t 和 x 的偏导数
         """综合损失"""
-        s_t = grad(s_pred.sum(), t, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        s_x = grad(s_pred.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
+        s_t = grad(s_pred.sum(),t,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        s_x = grad(s_pred.sum(),x,create_graph=True,only_inputs=True,allow_unused=True)[0]
         """热效应损失"""
         T_Q = experts[:, 0:1, :].squeeze(1)
-        # print(T_Q.shape)
         T = T_Q[:, 0:1]
         Q = T_Q[:, 1:2]
-        T_t = grad(T.sum(), t, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        T_x = grad(T.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        T_laplace = grad(T_t.sum(), t, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        loss_heat = torch.mean((T_t - (self.parameter_heat) * T_laplace - Q) ** 2, dim=1).unsqueeze(1)
+
+        # 选空间坐标（默认用 x 的第 1 维做空间坐标）
+        x_phys = x[:, 0:1]
+
+        # 梯度（用 safe_grad 防止 None）
+        T_t  = safe_grad(T.sum(), t)
+        T_x  = safe_grad(T.sum(), x_phys)
+        T_xx = safe_grad(T_x.sum(), x_phys)
+
+        rho_cp = 1.0
+        k = self.parameter_heat
+
+        res_heat = rho_cp * T_t - k * T_xx + Q
+
+        loss_heat = torch.mean(res_heat ** 2, dim=1).unsqueeze(1)
+
         """电化学效应损失"""
-        phi_c = experts[:, 1:2, :].squeeze(1)
-        phi = phi_c[:, 0:1]
-        c = phi_c[:, 1:2]
-        phi_t = grad(phi.sum(), t, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        phi_x = grad(phi.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        c_x = grad(c.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        c_t = grad(c.sum(), t, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        phi_laplace = grad(phi_x.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        c_laplace = grad(c_x.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        loss_electricity = torch.mean(
-            (c_t - self.parameter_electricity1 * c_laplace - self.parameter_electricity2) ** 2, dim=1).unsqueeze(
-            1) + torch.mean(phi_laplace ** 2, dim=1).unsqueeze(1)
+        phi_c=experts[:,1:2,:].squeeze(1)
+        phi=phi_c[:,0:1]
+        c=phi_c[:,1:2]
+        phi_t=grad(phi.sum(),t,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        phi_x=grad(phi.sum(),x,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        c_x=grad(c.sum(),x,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        c_t=grad(c.sum(),t,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        phi_laplace=grad(phi_x.sum(),x,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        c_laplace=grad(c_x.sum(),x,create_graph=True,only_inputs=True,allow_unused=True)[0]
+        loss_electricity=torch.mean((c_t -self.parameter_electricity1 * c_laplace -self.parameter_electricity2) ** 2,dim=1).unsqueeze(1)+torch.mean(phi_laplace** 2,dim=1).unsqueeze(1)
         """机械应力损失"""
         sigma_f = experts[:, 2:3, :].squeeze(1)
         sigma = sigma_f[:, 0:1]
         f = sigma_f[:, 1:2]
-        sigma_x = grad(sigma.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        sigma_laplace = grad(sigma_x.sum(), x, create_graph=True, only_inputs=True, allow_unused=True)[0]
-        loss_mechine = torch.mean((sigma_laplace + f) ** 2, dim=1).unsqueeze(1)
+
+        # 选空间坐标（默认用 x 的第 1 维做空间坐标）
+        x_phys = x[:, 0:1]
+
+        # 1D div(sigma) = dσ/dx
+        sigma_x = safe_grad(sigma.sum(), x_phys)
+
+        res_mech = sigma_x + f
+        loss_mechine = torch.mean(res_mech ** 2, dim=1).unsqueeze(1)
+
+
         # 打印 s_t 和 s_x，确保它们不为 None
         # 计算物理约束 F
-        F_input = torch.cat([phi, c, T, Q, sigma, f], dim=1)
+        F_input = torch.cat([phi,c,T,Q,sigma,f], dim=1)
         soh = self.physics(F_input)
         # 计算残差 f
-        loss_all = 1 * loss_electricity + 1 * loss_heat + 1 * loss_mechine
-        return soh, loss_all, [phi, c, T, Q, sigma, f]
+        loss_all = 1*loss_electricity+1*loss_heat+1*loss_mechine
+        return soh, loss_all,[phi,c,T,Q,sigma,f]
+
 
 
 class MLP(nn.Module):
